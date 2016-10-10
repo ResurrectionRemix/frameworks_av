@@ -167,6 +167,7 @@ private:
     uint32_t mBufferIDCount;
     KeyedVector<OMX::buffer_id, OMX_BUFFERHEADERTYPE *> mBufferIDToBufferHeader;
     KeyedVector<OMX_BUFFERHEADERTYPE *, OMX::buffer_id> mBufferHeaderToBufferID;
+#endif
     MetadataBufferType mMetadataType[2];
 
     // For debug support
