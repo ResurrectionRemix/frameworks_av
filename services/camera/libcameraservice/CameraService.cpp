@@ -74,6 +74,7 @@ using namespace hardware;
 // Logging support -- this is for debugging only
 // Use "adb shell dumpsys media.camera -v 1" to change it.
 volatile int32_t gLogLevel = 0;
+char gAppPackageName[50] = {'0'};
 
 #define LOG1(...) ALOGD_IF(gLogLevel >= 1, __VA_ARGS__);
 #define LOG2(...) ALOGD_IF(gLogLevel >= 2, __VA_ARGS__);
@@ -467,8 +468,8 @@ Status CameraService::getCameraInfo(int cameraId,
         // CameraInfo is for android.hardware.Camera which does not
         // support external camera facing. The closest approximation would be
         // front camera.
-        if (cameraInfo->orientation == CAMERA_FACING_EXTERNAL) {
-            cameraInfo->orientation = CAMERA_FACING_FRONT;
+        if (cameraInfo->facing == CAMERA_FACING_EXTERNAL) {
+            cameraInfo->facing = CAMERA_FACING_FRONT;
         }
     }
     return rc;
@@ -1264,6 +1265,7 @@ Status CameraService::connect(
     ATRACE_CALL();
     Status ret = Status::ok();
     String8 id = String8::format("%d", cameraId);
+    strncpy(gAppPackageName, String8(clientPackageName).string(), sizeof(gAppPackageName));
     sp<Client> client = nullptr;
     ret = connectHelper<ICameraClient,Client>(cameraClient, id,
             CAMERA_HAL_API_VERSION_UNSPECIFIED, clientPackageName, clientUid, clientPid, API_1,
@@ -1310,6 +1312,7 @@ Status CameraService::connectLegacy(
 
     Status ret = Status::ok();
     sp<Client> client = nullptr;
+    strncpy(gAppPackageName, String8(clientPackageName).string(), sizeof(gAppPackageName));
     ret = connectHelper<ICameraClient,Client>(cameraClient, id, halVersion,
             clientPackageName, clientUid, USE_CALLING_PID, API_1,
             /*legacyMode*/ true, /*shimUpdateOnly*/ false,
@@ -1337,6 +1340,8 @@ Status CameraService::connectDevice(
     Status ret = Status::ok();
     String8 id = String8::format("%d", cameraId);
     sp<CameraDeviceClient> client = nullptr;
+
+    strncpy(gAppPackageName, String8(clientPackageName).string(), sizeof(gAppPackageName));
     ret = connectHelper<hardware::camera2::ICameraDeviceCallbacks,CameraDeviceClient>(cameraCb, id,
             CAMERA_HAL_API_VERSION_UNSPECIFIED, clientPackageName,
             clientUid, USE_CALLING_PID, API_2,
@@ -2548,7 +2553,8 @@ status_t CameraService::dump(int fd, const Vector<String16>& args) {
                 write(fd, result.string(), result.size());
             } else {
                 result.appendFormat("  Facing: %s\n",
-                        info.facing == CAMERA_FACING_BACK ? "BACK" : "FRONT");
+                        info.facing == CAMERA_FACING_BACK ? "BACK" :
+                                info.facing == CAMERA_FACING_FRONT ? "FRONT" : "EXTERNAL");
                 result.appendFormat("  Orientation: %d\n", info.orientation);
                 int deviceVersion;
                 if (mModule->getModuleApiVersion() < CAMERA_MODULE_API_VERSION_2_0) {

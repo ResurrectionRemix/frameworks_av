@@ -743,8 +743,8 @@ status_t MediaCodecSource::feedEncoderInputBuffers() {
 }
 
 status_t MediaCodecSource::onStart(MetaData *params) {
-    if (mStopping) {
-        ALOGE("Failed to start while we're stopping");
+    if (mStopping | mOutput.lock()->mEncoderReachedEOS) {
+        ALOGE("Failed to start while we're stopping or encoder already stopped due to EOS error");
         return INVALID_OPERATION;
     }
 
@@ -772,8 +772,7 @@ status_t MediaCodecSource::onStart(MetaData *params) {
 
     if (mFlags & FLAG_USE_SURFACE_INPUT) {
         auto key = kKeyTime;
-        if (property_get_bool("persist.camera.HAL3.enabled", true) &&
-             !property_get_bool("media.camera.ts.monotonic", true)) {
+        if (!property_get_bool("media.camera.ts.monotonic", true)) {
             key = kKeyTimeBoot;
         }
 

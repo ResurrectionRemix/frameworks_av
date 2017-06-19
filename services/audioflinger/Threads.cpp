@@ -1380,6 +1380,11 @@ status_t AudioFlinger::PlaybackThread::checkEffectCompatibility_l(
     case DIRECT:
         // Reject any effect on Direct output threads for now, since the format of
         // mSinkBuffer is not guaranteed to be compatible with effect processing (PCM 16 stereo).
+        // Exception: allow effects for Direct PCM
+        if (mIsDirectPcm) {
+            // Allow effects when direct PCM enabled on Direct output
+            break;
+        }
         ALOGW("checkEffectCompatibility_l(): effect %s on DIRECT output thread %s",
                 desc->name, mThreadName);
         return BAD_VALUE;
@@ -1422,7 +1427,8 @@ sp<AudioFlinger::EffectHandle> AudioFlinger::ThreadBase::createEffect_l(
         audio_session_t sessionId,
         effect_descriptor_t *desc,
         int *enabled,
-        status_t *status)
+        status_t *status,
+        bool pinned)
 {
     sp<EffectModule> effect;
     sp<EffectHandle> handle;
@@ -1521,20 +1527,13 @@ sp<AudioFlinger::EffectHandle> AudioFlinger::ThreadBase::createEffect_l(
             }
             effectRegistered = true;
             // create a new effect module if none present in the chain
-            effect = new EffectModule(this, chain, desc, id, sessionId);
-            lStatus = effect->status();
-            if (lStatus != NO_ERROR) {
-                goto Exit;
-            }
+            lStatus = chain->createEffect_l(effect, this, desc, id, sessionId, pinned);
 
             bool setVal = false;
             if (mType == OFFLOAD || (mType == DIRECT && mIsDirectPcm)) {
                 setVal = true;
             }
 
-            effect->setOffloaded(setVal, mId);
-
-            lStatus = chain->addEffect_l(effect);
             if (lStatus != NO_ERROR) {
                 goto Exit;
             }
@@ -1576,6 +1575,33 @@ Exit:
 
     *status = lStatus;
     return handle;
+}
+
+void AudioFlinger::ThreadBase::disconnectEffectHandle(EffectHandle *handle,
+                                                      bool unpinIfLast)
+{
+    bool remove = false;
+    sp<EffectModule> effect;
+    {
+        Mutex::Autolock _l(mLock);
+
+        effect = handle->effect().promote();
+        if (effect == 0) {
+            return;
+        }
+        // restore suspended effects if the disconnected handle was enabled and the last one.
+        remove = (effect->removeHandle(handle) == 0) && (!effect->isPinned() || unpinIfLast);
+        if (remove) {
+            removeEffect_l(effect, true);
+        }
+    }
+    if (remove) {
+        mAudioFlinger->updateOrphanEffectChains(effect);
+        AudioSystem::unregisterEffect(effect->id());
+        if (handle->enabled()) {
+            checkSuspendOnEffectEnabled(effect, false, effect->sessionId());
+        }
+    }
 }
 
 sp<AudioFlinger::EffectModule> AudioFlinger::ThreadBase::getEffect(audio_session_t sessionId,
@@ -1647,9 +1673,9 @@ status_t AudioFlinger::ThreadBase::addEffect_l(const sp<EffectModule>& effect)
     return NO_ERROR;
 }
 
-void AudioFlinger::ThreadBase::removeEffect_l(const sp<EffectModule>& effect) {
+void AudioFlinger::ThreadBase::removeEffect_l(const sp<EffectModule>& effect, bool release) {
 
-    ALOGV("removeEffect_l() %p effect %p", this, effect.get());
+    ALOGV("%s %p effect %p", __FUNCTION__, this, effect.get());
     effect_descriptor_t desc = effect->desc();
     if ((desc.flags & EFFECT_FLAG_TYPE_MASK) == EFFECT_FLAG_TYPE_AUXILIARY) {
         detachAuxEffect_l(effect->id());
@@ -1658,7 +1684,7 @@ void AudioFlinger::ThreadBase::removeEffect_l(const sp<EffectModule>& effect) {
     sp<EffectChain> chain = effect->chain().promote();
     if (chain != 0) {
         // remove effect chain if removing last effect
-        if (chain->removeEffect_l(effect) == 0) {
+        if (chain->removeEffect_l(effect, release) == 0) {
             removeEffectChain_l(chain);
         }
     } else {
@@ -3668,6 +3694,8 @@ status_t AudioFlinger::PlaybackThread::releaseAudioPatch_l(const audio_patch_han
         status = mOutput->stream->common.set_parameters(&mOutput->stream->common,
                 param.toString().string());
     }
+    sendIoConfigEvent_l(AUDIO_OUTPUT_CONFIG_CHANGED);
+    mPrevOutDevice = mOutDevice;
     return status;
 }
 
@@ -3699,6 +3727,7 @@ AudioFlinger::MixerThread::MixerThread(const sp<AudioFlinger>& audioFlinger, Aud
         // mAudioMixer below
         // mFastMixer below
         mFastMixerFutex(0),
+        mFastMixerIdlePending(false),
         mMasterMono(false)
         // mOutputSink below
         // mPipeSink below
@@ -3930,16 +3959,18 @@ ssize_t AudioFlinger::MixerThread::threadLoop_write()
         FastMixerState *state = sq->begin();
         if (state->mCommand != FastMixerState::MIX_WRITE &&
                 (kUseFastMixer != FastMixer_Dynamic || state->mTrackMask > 1)) {
-            if (state->mCommand == FastMixerState::COLD_IDLE) {
+            if (state->mCommand == FastMixerState::COLD_IDLE || mFastMixerIdlePending) {
 
+                mFastMixerIdlePending = false;
                 // FIXME workaround for first HAL write being CPU bound on some devices
                 ATRACE_BEGIN("write");
                 mOutput->write((char *)mSinkBuffer, 0);
                 ATRACE_END();
-
-                int32_t old = android_atomic_inc(&mFastMixerFutex);
-                if (old == -1) {
-                    (void) syscall(__NR_futex, &mFastMixerFutex, FUTEX_WAKE_PRIVATE, 1);
+                if (state->mCommand == FastMixerState::COLD_IDLE) {
+                    int32_t old = android_atomic_inc(&mFastMixerFutex);
+                    if (old == -1) {
+                        (void) syscall(__NR_futex, &mFastMixerFutex, FUTEX_WAKE_PRIVATE, 1);
+                    }
                 }
 #ifdef AUDIO_WATCHDOG
                 if (mAudioWatchdog != 0) {
@@ -3971,10 +4002,20 @@ void AudioFlinger::MixerThread::threadLoop_standby()
         FastMixerStateQueue *sq = mFastMixer->sq();
         FastMixerState *state = sq->begin();
         if (!(state->mCommand & FastMixerState::IDLE)) {
-            state->mCommand = FastMixerState::COLD_IDLE;
-            state->mColdFutexAddr = &mFastMixerFutex;
-            state->mColdGen++;
-            mFastMixerFutex = 0;
+            // if standby is called due to output suspended, when
+            // 1): for dynamic usage, if there are FAST tracks OR
+            // 2): for none dynamic usage, if there are active tracks
+            // we still need to mix the data for tracks but not write to HAL
+            if (isSuspended () && ((kUseFastMixer == FastMixer_Dynamic && state->mTrackMask > 1) ||
+                    (kUseFastMixer != FastMixer_Dynamic && mActiveTracks.size()))) {
+                state->mCommand = FastMixerState::MIX;
+                mFastMixerIdlePending = true;
+            } else {
+                state->mCommand = FastMixerState::COLD_IDLE;
+                state->mColdFutexAddr = &mFastMixerFutex;
+                state->mColdGen++;
+                mFastMixerFutex = 0;
+            }
             sq->end();
             // BLOCK_UNTIL_PUSHED would be insufficient, as we need it to stop doing I/O now
             sq->push(FastMixerStateQueue::BLOCK_UNTIL_ACKED);
@@ -4042,6 +4083,26 @@ void AudioFlinger::MixerThread::threadLoop_mix()
 {
     // mix buffers...
     mAudioMixer->process();
+    // for mixerthread with fastmixer enabled, if it's already suspended, start mixing when
+    // 1) for dynamic usage and there are active FAST tracks
+    // 2) for none dynmaic usage, always enable mixing
+    if (mFastMixer != 0 && isSuspended()) {
+        FastMixerStateQueue *sq = mFastMixer->sq();
+        FastMixerState *state = sq->begin();
+        if (state->mCommand == FastMixerState::COLD_IDLE && (kUseFastMixer != FastMixer_Dynamic ||
+                (kUseFastMixer == FastMixer_Dynamic && state->mTrackMask > 1))) {
+            int32_t old = android_atomic_inc(&mFastMixerFutex);
+            if (old == -1) {
+                (void) syscall(__NR_futex, &mFastMixerFutex, FUTEX_WAKE_PRIVATE, 1);
+            }
+            state->mCommand = FastMixerState::MIX;
+            sq->end();
+            sq->push(FastMixerStateQueue::BLOCK_UNTIL_PUSHED);
+            mFastMixerIdlePending = true;
+        } else {
+            sq->end(false /*didModify*/);
+        }
+    }
     mCurrentWriteLength = mSinkBufferSize;
     // increase sleep time progressively when application underrun condition clears.
     // Only increase sleep time if the mixer is ready for two consecutive times to avoid
@@ -4627,7 +4688,7 @@ AudioFlinger::PlaybackThread::mixer_state AudioFlinger::MixerThread::prepareTrac
         state->mFastTracksGen++;
         // if the fast mixer was active, but now there are no fast tracks, then put it in cold idle
         if (kUseFastMixer == FastMixer_Dynamic &&
-                state->mCommand == FastMixerState::MIX_WRITE && state->mTrackMask <= 1) {
+                (state->mCommand & FastMixerState::MIX_WRITE) && state->mTrackMask <= 1) {
             state->mCommand = FastMixerState::COLD_IDLE;
             state->mColdFutexAddr = &mFastMixerFutex;
             state->mColdGen++;
@@ -4639,6 +4700,8 @@ AudioFlinger::PlaybackThread::mixer_state AudioFlinger::MixerThread::prepareTrac
             // so that fast mixer stops doing I/O.
             block = FastMixerStateQueue::BLOCK_UNTIL_ACKED;
             pauseAudioWatchdog = true;
+            if (mFastMixerIdlePending)
+                mFastMixerIdlePending = false;
         }
     }
     if (sq != NULL) {
@@ -4714,6 +4777,19 @@ AudioFlinger::PlaybackThread::mixer_state AudioFlinger::MixerThread::prepareTrac
         EffectDapController::instance()->updatePregain(mType, mId, mOutput->flags, max_vol);
     }
 #endif // DOLBY_END
+
+    // if no more ative tracks available, put the fastmixer into COLD_IDLE
+    if (mFastMixerIdlePending && !mActiveTracks.size()) {
+        state = sq->begin();
+        state->mCommand = FastMixerState::COLD_IDLE;
+        state->mColdFutexAddr = &mFastMixerFutex;
+        state->mColdGen++;
+        mFastMixerFutex = 0;
+        // I/O was already stopped during standby, no need to wait for ack
+        sq->end();
+        sq->push(FastMixerStateQueue::BLOCK_UNTIL_PUSHED);
+        mFastMixerIdlePending = false;
+    }
     return mixerStatus;
 }
 
@@ -5166,15 +5242,19 @@ AudioFlinger::PlaybackThread::mixer_state AudioFlinger::DirectOutputThread::prep
                     // indicate to client process that the track was disabled because of underrun;
                     // it will then automatically call start() when data is available
                     track->disable();
-                } else if (last) {
+                    // only do hw pause when track is going to be removed due to BUFFER TIMEOUT.
+                    // unlike mixerthread, HAL can be paused for direct output, and as HAL can be
+                    // paused at the first underrun, but track may be ready for the next loop and
+                    // the playback is resumed, it will make the playback interrupted
                     ALOGW("pause because of UNDERRUN, framesReady = %zu,"
                             "minFrames = %u, mFormat = %#x",
                             track->framesReady(), minFrames, mFormat);
-                    mixerStatus = MIXER_TRACKS_ENABLED;
-                    if (mHwSupportsPause && !mHwPaused && !mStandby) {
+                    if (mHwSupportsPause && last && !mHwPaused && !mStandby) {
                         doHwPause = true;
                         mHwPaused = true;
                     }
+                } else if (last) {
+                    mixerStatus = MIXER_TRACKS_ENABLED;
                 }
             }
         }

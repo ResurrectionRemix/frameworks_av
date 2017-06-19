@@ -817,8 +817,7 @@ status_t CameraSource::start(MetaData *meta) {
         int64_t startTimeUs;
 
         auto key = kKeyTime;
-        if (property_get_bool("persist.camera.HAL3.enabled", true) &&
-             !property_get_bool("media.camera.ts.monotonic", true)) {
+        if (!property_get_bool("media.camera.ts.monotonic", true)) {
             key = kKeyTimeBoot;
         }
 
@@ -1161,7 +1160,7 @@ void CameraSource::releaseRecordingFrameHandle(native_handle_t* handle) {
         int64_t token = IPCThreadState::self()->clearCallingIdentity();
         mCamera->releaseRecordingFrameHandle(handle);
         IPCThreadState::self()->restoreCallingIdentity(token);
-    } else {
+    } else if (handle != nullptr) {
         native_handle_close(handle);
         native_handle_delete(handle);
     }
